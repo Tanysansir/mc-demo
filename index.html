@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>方块世界 · 步行模拟</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; }
+
+  /* 准星 */
+  #crosshair {
+    position: fixed; left: 50%; top: 50%; width: 20px; height: 20px;
+    transform: translate(-50%, -50%); z-index: 4; pointer-events: none;
+  }
+  #crosshair::before, #crosshair::after {
+    content: ''; position: absolute; background: rgba(255,255,255,.85);
+  }
+  #crosshair::before { left: 9px; top: 0; width: 2px; height: 20px; }
+  #crosshair::after  { top: 9px; left: 0; height: 2px; width: 20px; }
+
+  /* 边界图片：到达边界时覆盖整个游戏画面 */
+  #boundary {
+    position: fixed; inset: 0; width: 100vw; height: 100vh;
+    background: #111 url('boundary.jpg') no-repeat center center / cover;
+    opacity: 0; pointer-events: none; transition: opacity .3s ease; z-index: 5;
+  }
+  #boundary.show { opacity: 1; }
+
+  /* 开始提示 */
+  #hint {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.45); color: #fff; z-index: 6; text-align: center;
+    font: 17px/1.9 "Microsoft YaHei", monospace; letter-spacing: 1px;
+  }
+  #hint.hidden { display: none; }
+  #hint b { font-size: 20px; }
+</style>
+</head>
+<body>
+<div id="crosshair"></div>
+<div id="boundary"></div>
+<div id="hint">
+  <div>
+    <b>点击屏幕开始</b><br>
+    W A S D / 方向键 移动 · 鼠标 视角 · 空格 跳跃<br>
+    往任意方向走约 10 秒即到达世界边界
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  /* ================= 基础常量 ================= */
+  var BOUNDARY = 50;     // 世界半径（方块），速度 5 格/秒 × 10 秒 = 50 格
+  var SPEED    = 5.0;    // 移动速度（格/秒）
+  var EYE      = 1.62;   // 眼睛高度
+  var JUMP     = 8.2;    // 起跳速度
+  var GRAVITY  = -26;    // 重力
+  var SENS     = 0.0022; // 鼠标灵敏度
+
+  var S = BOUNDARY * 2 + 1; // 101
+  var H = 28;               // 世界高度
+  var OFF = BOUNDARY;       // 世界坐标 -50..50 → 数组索引 0..100
+
+  var GRASS = 1, DIRT = 2, STONE = 3, LOG = 4, LEAVES = 5;
+
+  /* ================= 渲染器 / 场景 / 相机 ================= */
+  var renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  var scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0xcfd9e6, 55, 150);
+
+  var camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 600);
+  camera.rotation.order = 'YXZ';
+
+  /* 天空：背景色 + 渐变穹顶（跟随相机，保持地平线在视线高度） */
+  scene.background = new THREE.Color(0xa8ccef);
+  var skyDome = new THREE.Mesh(
+    new THREE.SphereGeometry(420, 16, 12),
+    new THREE.MeshBasicMaterial({ side: THREE.BackSide, vertexColors: true, fog: false })
+  );
+  var skyPosAttr = skyDome.geometry.attributes.position;
+  var skyCol = [];
+  var _lerp = function (a, b, t) { return a + (b - a) * t; };
+  for (var _i = 0; _i < skyPosAttr.count; _i++) {
+    var _y = skyPosAttr.getY(_i) / 420;                 // -1(底) .. 1(顶)
+    var _t = Math.max(0, Math.min(1, (_y + 1) / 2));    // 0(底) .. 1(顶)
+    skyCol.push(_lerp(0xd8, 0x6f, _t) / 255, _lerp(0xe2, 0xb2, _t) / 255, _lerp(0xee, 0xe8, _t) / 255);
+  }
+  skyDome.geometry.setAttribute('color', new THREE.Float32BufferAttribute(skyCol, 3));
+  skyDome.frustumCulled = false;
+  scene.add(skyDome);
+
+  /* 太阳（始终面向相机的方块） */
+  var sunCanvas = document.createElement('canvas');
+  sunCanvas.width = sunCanvas.height = 16;
+  var sunCtx = sunCanvas.getContext('2d');
+  sunCtx.fillStyle = '#fff6c8'; sunCtx.fillRect(0, 0, 16, 16);
+  var sun = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(sunCanvas), fog: false }));
+  sun.scale.set(13, 13, 1);
+  sun.position.set(45, 70, -150);
+  scene.add(sun);
+
+  /* ================= 纹理图集（程序化绘制，像素风） ================= */
+  var TS = 16, COLS = 8, ROWS = 8;
+  var atlasCanvas = document.createElement('canvas');
+  atlasCanvas.width = COLS * TS; atlasCanvas.height = ROWS * TS;
+  var a = atlasCanvas.getContext('2d');
+  function put(t, ox, oy, c) { a.fillStyle = c; a.fillRect(t.x + ox, t.y + oy, 1, 1); }
+  function tile(tx, ty) { return { x: tx * TS, y: ty * TS }; }
+
+  function grassTop(t) {
+    for (var y = 0; y < TS; y++) for (var x = 0; x < TS; x++) {
+      var r = Math.random();
+      put(t, x, y, r < 0.55 ? '#79b85a' : r < 0.8 ? '#69a64b' : '#8cc96e');
+    }
+  }
+  function dirtPx() { var r = Math.random(); return r < 0.5 ? '#8c6b4a' : r < 0.76 ? '#7a5c3e' : '#9c7b58'; }
+  function grassSide(t) {
+    for (var y = 0; y < TS; y++) for (var x = 0; x < TS; x++) {
+      put(t, x, y, y < 4 ? (Math.random() < 0.5 ? '#79b85a' : '#69a64b') : dirtPx());
+    }
+  }
+  function dirt(t) { for (var y = 0; y < TS; y++) for (var x = 0; x < TS; x++) put(t, x, y, dirtPx()); }
+  function stone(t) { for (var y = 0; y < TS; y++) for (var x = 0; x < TS; x++) {
+    var r = Math.random(); put(t, x, y, r < 0.5 ? '#8c8c8c' : r < 0.78 ? '#7a7a7a' : '#9e9e9e'); } }
+  function logSide(t) { for (var y = 0; y < TS; y++) for (var x = 0; x < TS; x++) {
+    var r = Math.random(); var c = (x % 4 < 1) ? '#4f3a1c' : (r < 0.7 ? '#6b4f2a' : '#7a5c33');
+    put(t, x, y, c); } }
+  function logTop(t) { for (var y = 0; y < TS; y++) for (var x = 0; x < TS; x++) {
+    var d = Math.sqrt((x - 7.5) * (x - 7.5) + (y - 7.5) * (y - 7.5));
+    put(t, x, y, Math.floor(d) % 2 === 0 ? '#8c6b4a' : '#6b4f2a'); } }
+  function leaves(t) { for (var y = 0; y < TS; y++) for (var x = 0; x < TS; x++) {
+    var r = Math.random(); put(t, x, y, r < 0.55 ? '#3f7a2f' : r < 0.85 ? '#2e5e24' : '#4e8f3c'); } }
+
+  grassTop(tile(0, 0)); grassSide(tile(1, 0)); dirt(tile(2, 0)); stone(tile(3, 0));
+  logSide(tile(4, 0)); logTop(tile(5, 0)); leaves(tile(6, 0));
+
+  var atlasTex = new THREE.CanvasTexture(atlasCanvas);
+  atlasTex.magFilter = THREE.NearestFilter;
+  atlasTex.minFilter = THREE.NearestFilter;
+  atlasTex.flipY = false; // v=0 对应画布顶部
+
+  /* 花朵纹理（透明背景） */
+  var flowerCanvas = document.createElement('canvas');
+  flowerCanvas.width = TS * 2; flowerCanvas.height = TS;
+  var fc = flowerCanvas.getContext('2d');
+  function drawFlower(tx, petal, center) {
+    var ox = tx * TS;
+    fc.clearRect(ox, 0, TS, TS);
+    fc.fillStyle = petal;
+    fc.fillRect(ox + 6, 6, 4, 4);    // 中心块
+    fc.fillRect(ox + 7, 2, 2, 4);    // 上花瓣
+    fc.fillRect(ox + 7, 10, 2, 4);   // 下花瓣
+    fc.fillRect(ox + 2, 7, 4, 2);    // 左花瓣
+    fc.fillRect(ox + 10, 7, 4, 2);   // 右花瓣
+    fc.fillStyle = center;
+    fc.fillRect(ox + 7, 7, 2, 2);    // 花蕊
+  }
+  drawFlower(0, '#d64545', '#f5d76e'); // 红花
+  drawFlower(1, '#e8c33b', '#8a5a2b'); // 黄花
+  var flowerTex = new THREE.CanvasTexture(flowerCanvas);
+  flowerTex.magFilter = THREE.NearestFilter; flowerTex.minFilter = THREE.NearestFilter;
+  flowerTex.flipY = false;
+
+  /* ================= 噪声与地形 ================= */
+  function hash2(x, z) {
+    var n = (x * 374761393 + z * 668265263) | 0;
+    n = Math.imul(n ^ (n >>> 13), 1274126177);
+    n = (n ^ (n >>> 16)) >>> 0;
+    return n / 4294967296;
+  }
+  function vnoise(x, z) {
+    var xi = Math.floor(x), zi = Math.floor(z);
+    var xf = x - xi, zf = z - zi;
+    var u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+    var a = hash2(xi, zi), b = hash2(xi + 1, zi), c = hash2(xi, zi + 1), d = hash2(xi + 1, zi + 1);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  }
+  function heightAt(x, z) {
+    var n = vnoise(x * 0.045, z * 0.045);
+    var m = vnoise(x * 0.13 + 10, z * 0.13 + 10);
+    var h = 9 + (n - 0.5) * 10 + (m - 0.5) * 3;
+    var d = Math.sqrt(x * x + z * z);          // 出生点附近压平，留出空地
+    if (d < 10) h = h * (d / 10) + 9 * (1 - d / 10);
+    return Math.max(2, Math.min(H - 6, Math.round(h)));
+  }
+
+  /* ================= 方块数据 ================= */
+  var blocks = new Uint8Array(S * S * H);
+  function idx(x, y, z) { return (y * S + z) * S + x; } // x,z 已是 0..S-1 的索引
+  function setBlock(x, y, z, id) {
+    if (y < 0 || y >= H) return;
+    var xi = x + OFF, zi = z + OFF;
+    if (xi < 0 || xi >= S || zi < 0 || zi >= S) return;
+    blocks[(y * S + zi) * S + xi] = id;
+  }
+  function getBlock(x, y, z) {
+    if (y < 0 || y >= H) return 0;
+    var xi = x + OFF, zi = z + OFF;
+    if (xi < 0 || xi >= S || zi < 0 || zi >= S) return 0;
+    return blocks[(y * S + zi) * S + xi];
+  }
+
+  /* 生成地形 */
+  for (var gx = -BOUNDARY; gx <= BOUNDARY; gx++) {
+    for (var gz = -BOUNDARY; gz <= BOUNDARY; gz++) {
+      var h = heightAt(gx, gz);
+      setBlock(gx, h, gz, GRASS);
+      for (var y = h - 1; y > h - 4; y--) setBlock(gx, y, gz, DIRT);
+      for (var y = h - 4; y >= 0; y--) setBlock(gx, y, gz, STONE);
+    }
+  }
+
+  /* 随机数（种子固定，保证每次刷新地形一致） */
+  function mulberry32(seed) {
+    return function () {
+      seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+      var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rand = mulberry32(20260830);
+
+  /* 种树 */
+  function addTree(x, z) {
+    var base = heightAt(x, z) + 1;
+    var th = 4 + Math.floor(rand() * 3);           // 树干高度 4-6
+    var i;
+    for (i = 0; i < th; i++) setBlock(x, base + i, z, LOG);
+    var ty = base + th;                            // 第一层树叶
+    var leaf = function (lx, ly, lz) { if (!getBlock(lx, ly, lz)) setBlock(lx, ly, lz, LEAVES); };
+    var dy, dx, dz;
+    for (dy = 0; dy < 2; dy++)                     // 两层 3x3 树冠
+      for (dx = -1; dx <= 1; dx++) for (dz = -1; dz <= 1; dz++)
+        leaf(x + dx, ty + dy, z + dz);
+    leaf(x, ty + 2, z);                            // 顶部十字
+    leaf(x + 1, ty + 2, z); leaf(x - 1, ty + 2, z);
+    leaf(x, ty + 2, z + 1); leaf(x, ty + 2, z - 1);
+  }
+  var treeCount = 0;
+  while (treeCount < 55) {
+    var tx = Math.floor(rand() * (BOUNDARY * 2 - 8)) - (BOUNDARY - 4);
+    var tz = Math.floor(rand() * (BOUNDARY * 2 - 8)) - (BOUNDARY - 4);
+    if (Math.sqrt(tx * tx + tz * tz) < 8) continue; // 出生点附近不种树
+    addTree(tx, tz);
+    treeCount++;
+  }
+
+  /* ================= 网格构建（合并为单次绘制） ================= */
+  var FACES = [
+    { dir: [0, 1, 0], b: 1.00, kind: 'top',    c: [[0,1,0,0,0],[1,1,0,1,0],[1,1,1,1,1],[0,1,1,0,1]] },
+    { dir: [0,-1, 0], b: 0.55, kind: 'bottom', c: [[0,0,0,0,0],[1,0,0,1,0],[1,0,1,1,1],[0,0,1,0,1]] },
+    { dir: [1, 0, 0], b: 0.80, kind: 'side',   c: [[1,0,1,1,1],[1,1,1,1,0],[1,1,0,0,0],[1,0,0,0,1]] },
+    { dir: [-1,0, 0], b: 0.80, kind: 'side',   c: [[0,0,0,0,1],[0,1,0,0,0],[0,1,1,1,0],[0,0,1,1,1]] },
+    { dir: [0, 0, 1], b: 0.70, kind: 'side',   c: [[0,0,1,0,1],[0,1,1,0,0],[1,1,1,1,0],[1,0,1,1,1]] },
+    { dir: [0, 0,-1], b: 0.70, kind: 'side',   c: [[1,0,0,0,1],[1,1,0,0,0],[0,1,0,1,0],[0,0,0,1,1]] }
+  ];
+  var TILES = [[0,0],[1,0],[2,0],[3,0],[4,0],[5,0],[6,0]];
+  function blockTile(id, kind) {
+    if (id === GRASS) return kind === 'top' ? 0 : kind === 'bottom' ? 2 : 1;
+    if (id === DIRT)  return 2;
+    if (id === STONE) return 3;
+    if (id === LOG)   return (kind === 'top' || kind === 'bottom') ? 5 : 4;
+    if (id === LEAVES) return 6;
+    return 0;
+  }
+
+  var positions = [], uvs = [], colors = [], indices = [];
+  var xi, yi, zi;
+  for (yi = 0; yi < H; yi++) for (zi = 0; zi < S; zi++) for (xi = 0; xi < S; xi++) {
+    var id = blocks[idx(xi, yi, zi)];
+    if (!id) continue;
+    for (var f = 0; f < 6; f++) {
+      var face = FACES[f], d = face.dir;
+      var nx = xi + d[0], ny = yi + d[1], nz = zi + d[2];
+      if (nx >= 0 && nx < S && nz >= 0 && nz < S && ny >= 0 && ny < H && blocks[idx(nx, ny, nz)]) continue;
+      var ti = blockTile(id, face.kind), tp = TILES[ti];
+      var base = positions.length / 3;
+      for (var k = 0; k < 4; k++) {
+        var c = face.c[k];
+        positions.push((xi - OFF) + c[0], yi + c[1], (zi - OFF) + c[2]);
+        uvs.push((tp[0] + c[3]) / COLS, (tp[1] + c[4]) / ROWS);
+        colors.push(face.b, face.b, face.b);
+      }
+      indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  }
+
+  var terrainGeo = new THREE.BufferGeometry();
+  terrainGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  terrainGeo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  terrainGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  terrainGeo.setIndex(indices);
+  terrainGeo.computeBoundingSphere();
+  var terrain = new THREE.Mesh(terrainGeo,
+    new THREE.MeshBasicMaterial({ map: atlasTex, vertexColors: true, side: THREE.DoubleSide }));
+  terrain.frustumCulled = false;
+  scene.add(terrain);
+
+  /* 花朵（十字交叉片） */
+  var fpos = [], fuv = [], fidx = [];
+  var flowers = [];
+  for (var fn = 0; fn < 45; fn++) {
+    var fx = Math.floor(rand() * (BOUNDARY * 2 - 8)) - (BOUNDARY - 4);
+    var fz = Math.floor(rand() * (BOUNDARY * 2 - 8)) - (BOUNDARY - 4);
+    var fh = heightAt(fx, fz);
+    if (Math.sqrt(fx * fx + fz * fz) < 3) continue;              // 出生点附近不放花
+    if (getBlock(fx, fh, fz) !== GRASS || getBlock(fx, fh + 1, fz)) continue;
+    flowers.push({ x: fx + 0.5, y: fh + 1, z: fz + 0.5, c: fn % 2 });
+  }
+  function quad(a1, b1, c1, d1, tileCol) {                       // 四顶点 + 两个三角形
+    var base = fpos.length / 3;
+    var arr = [a1, b1, c1, d1];
+    var u0 = tileCol * 0.5, u1 = u0 + 0.5;
+    var uv = [[u0, 1], [u0, 0], [u1, 0], [u1, 1]];              // v=0 在上
+    for (var i = 0; i < 4; i++) { fpos.push(arr[i][0], arr[i][1], arr[i][2]); fuv.push(uv[i][0], uv[i][1]); }
+    fidx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+  var s2 = 0.35, h2 = 0.7;
+  for (var fk = 0; fk < flowers.length; fk++) {
+    var fl = flowers[fk];
+    quad([fl.x, fl.y, fl.z - s2], [fl.x, fl.y + h2, fl.z - s2], [fl.x, fl.y + h2, fl.z + s2], [fl.x, fl.y, fl.z + s2], fl.c);
+    quad([fl.x - s2, fl.y, fl.z], [fl.x - s2, fl.y + h2, fl.z], [fl.x + s2, fl.y + h2, fl.z], [fl.x + s2, fl.y, fl.z], fl.c);
+  }
+  var flowerGeo = new THREE.BufferGeometry();
+  flowerGeo.setAttribute('position', new THREE.Float32BufferAttribute(fpos, 3));
+  flowerGeo.setAttribute('uv', new THREE.Float32BufferAttribute(fuv, 2));
+  flowerGeo.setIndex(fidx);
+  var flowerMat = new THREE.MeshBasicMaterial({ map: flowerTex, transparent: true, alphaTest: 0.5, side: THREE.DoubleSide });
+  var flowerMesh = new THREE.Mesh(flowerGeo, flowerMat);
+  flowerMesh.frustumCulled = false;
+  scene.add(flowerMesh);
+
+  /* ================= 云朵 ================= */
+  var cloudMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85, fog: false });
+  var clouds = [];
+  for (var ci = 0; ci < 14; ci++) {
+    var m = new THREE.Mesh(new THREE.BoxGeometry(8 + Math.random() * 16, 1.6 + Math.random() * 1.4, 6 + Math.random() * 10), cloudMat);
+    m.position.set(Math.random() * 160 - 80, 34 + Math.random() * 6, Math.random() * 160 - 80);
+    clouds.push({ m: m, speed: 0.6 + Math.random() * 1.6 });
+    scene.add(m);
+  }
+
+  /* ================= 世界边界墙 ================= */
+  var stripeCanvas = document.createElement('canvas');
+  stripeCanvas.width = stripeCanvas.height = 64;
+  var sctx = stripeCanvas.getContext('2d');
+  sctx.fillStyle = 'rgba(255,60,60,0.9)';
+  for (var si = -64; si < 64; si += 16) {
+    sctx.beginPath();
+    sctx.moveTo(si, 0); sctx.lineTo(si + 8, 0); sctx.lineTo(si + 72, 64); sctx.lineTo(si + 64, 64);
+    sctx.closePath(); sctx.fill();
+  }
+  var stripeTex = new THREE.CanvasTexture(stripeCanvas);
+  stripeTex.wrapS = stripeTex.wrapT = THREE.RepeatWrapping;
+  stripeTex.repeat.set(20, 4);
+  var borderMat = new THREE.MeshBasicMaterial({ map: stripeTex, transparent: true, opacity: 0.4, side: THREE.DoubleSide, depthWrite: false, fog: false });
+  var walls = [];
+  function addWall(w, h, x, y, z, ry) {
+    var wall = new THREE.Mesh(new THREE.PlaneGeometry(w, h), borderMat);
+    wall.position.set(x, y, z); wall.rotation.y = ry;
+    wall.frustumCulled = false; scene.add(wall); walls.push(wall);
+  }
+  var WALLH = 22;
+  addWall(BOUNDARY * 2, WALLH, 0, WALLH / 2, -BOUNDARY, 0);          // 北
+  addWall(BOUNDARY * 2, WALLH, 0, WALLH / 2,  BOUNDARY, Math.PI);     // 南
+  addWall(BOUNDARY * 2, WALLH, -BOUNDARY, WALLH / 2, 0, Math.PI / 2); // 西
+  addWall(BOUNDARY * 2, WALLH,  BOUNDARY, WALLH / 2, 0, -Math.PI / 2);// 东
+
+  /* ================= 玩家控制 ================= */
+  var pos = new THREE.Vector3(0, heightAt(0, 0) + 1, 0); // 脚部位置
+  var yaw = 0, pitch = 0, vy = 0, grounded = true;
+  var keys = {};
+  var locked = false;
+
+  var hint = document.getElementById('hint');
+  var boundaryEl = document.getElementById('boundary');
+
+  document.addEventListener('click', function () { renderer.domElement.requestPointerLock(); });
+  document.addEventListener('pointerlockchange', function () {
+    locked = document.pointerLockElement === renderer.domElement;
+    hint.classList.toggle('hidden', locked);
+  });
+  document.addEventListener('mousemove', function (e) {
+    if (!locked) return;
+    yaw -= e.movementX * SENS;
+    pitch -= e.movementY * SENS;
+    pitch = Math.max(-1.5, Math.min(1.5, pitch));
+  });
+  document.addEventListener('keydown', function (e) { keys[e.code] = true; });
+  document.addEventListener('keyup', function (e) { keys[e.code] = false; });
+  window.addEventListener('resize', function () {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  function update(dt) {
+    // 移动方向（水平）
+    var fwd = (keys['KeyW'] || keys['ArrowUp'] ? 1 : 0) - (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0);
+    var str = (keys['KeyD'] || keys['ArrowRight'] ? 1 : 0) - (keys['KeyA'] || keys['ArrowLeft'] ? 1 : 0);
+    var fx = -Math.sin(yaw), fz = -Math.cos(yaw);       // 前
+    var rx = Math.cos(yaw), rz = -Math.sin(yaw);        // 右
+    var mx = fx * fwd + rx * str, mz = fz * fwd + rz * str;
+    var ml = Math.sqrt(mx * mx + mz * mz);
+    if (ml > 0) { mx /= ml; mz /= ml; pos.x += mx * SPEED * dt; pos.z += mz * SPEED * dt; }
+
+    // 跳跃与重力
+    if ((keys['Space']) && grounded) { vy = JUMP; grounded = false; }
+    vy += GRAVITY * dt;
+    pos.y += vy * dt;
+    var ground = heightAt(pos.x, pos.z) + 1;
+    if (pos.y <= ground) { pos.y = ground; vy = 0; grounded = true; }
+
+    // 边界约束
+    if (pos.x >  BOUNDARY) pos.x =  BOUNDARY;
+    if (pos.x < -BOUNDARY) pos.x = -BOUNDARY;
+    if (pos.z >  BOUNDARY) pos.z =  BOUNDARY;
+    if (pos.z < -BOUNDARY) pos.z = -BOUNDARY;
+
+    // 到达边界 → 显示图片覆盖画面
+    var atEdge = Math.abs(pos.x) >= BOUNDARY - 0.01 || Math.abs(pos.z) >= BOUNDARY - 0.01;
+    boundaryEl.classList.toggle('show', atEdge);
+
+    // 更新相机
+    camera.position.set(pos.x, pos.y + EYE, pos.z);
+    camera.rotation.y = yaw; camera.rotation.x = pitch;
+    skyDome.position.copy(camera.position);
+
+    // 云朵飘动
+    for (var i = 0; i < clouds.length; i++) {
+      var cl = clouds[i];
+      cl.m.position.x += cl.speed * dt;
+      if (cl.m.position.x > 90) cl.m.position.x = -90;
+    }
+
+    // 边界墙条纹流动
+    stripeTex.offset.x -= dt * 0.12;
+  }
+
+  var clock = new THREE.Clock();
+  function animate() {
+    requestAnimationFrame(animate);
+    update(Math.min(clock.getDelta(), 0.05));
+    renderer.render(scene, camera);
+  }
+  animate();
+})();
+</script>
+</body>
+</html>
